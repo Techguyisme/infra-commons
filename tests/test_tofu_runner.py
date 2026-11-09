@@ -300,3 +300,96 @@ def test_check_plan_refuses_and_sorts_violations():
     with pytest.raises(plangate.ProtectedDestroyError) as e:
         plangate.check_plan(doc, frozenset({"z.z", "a.a"}), log=lambda *_: None)
     assert e.value.addresses == ["a.a", "z.z"]
+
+
+# ------------------------------------------------- Ctrl-C safety (AIA-41)
+
+
+class _InterruptedWait:
+    """Popen stand-in: the first wait() is interrupted (the operator's
+    Ctrl-C arriving in the parent), the second returns the child's own
+    exit. kill()/terminate() must never be called."""
+
+    def __init__(self, final_rc: int):
+        self.final_rc = final_rc
+        self.wait_calls = 0
+        self.killed = False
+
+    def __call__(self, args, cwd=None, env=None):
+        return self
+
+    def wait(self):
+        self.wait_calls += 1
+        if self.wait_calls == 1:
+            raise KeyboardInterrupt
+        return self.final_rc
+
+    def kill(self):  # pragma: no cover - the assertion is that this never runs
+        self.killed = True
+
+    def terminate(self):  # pragma: no cover - same
+        self.killed = True
+
+
+def test_interrupted_apply_waits_and_reraises_instead_of_killing():
+    fake = _InterruptedWait(final_rc=0)
+    with pytest.raises(KeyboardInterrupt):
+        tr._apply_planfile(["tofu", "apply"], Path("."), {}, popen=fake)
+    assert fake.wait_calls == 2, "the child must be reaped after the interrupt"
+    assert not fake.killed, "a graceful stop must never be SIGKILLed"
+
+
+def test_second_interrupt_still_never_kills():
+    fake = _InterruptedWait(final_rc=1)
+    orig = fake.wait
+
+    def wait_twice_interrupted():
+        fake.wait_calls += 1
+        if fake.wait_calls <= 2:
+            raise KeyboardInterrupt
+        return fake.final_rc
+
+    fake.wait = wait_twice_interrupted
+    with pytest.raises(KeyboardInterrupt):
+        tr._apply_planfile(["tofu", "apply"], Path("."), {}, popen=fake)
+    assert fake.wait_calls == 3 and not fake.killed
+    del orig
+
+
+def test_uninterrupted_apply_returns_the_exit_status():
+    class PlainProc(_InterruptedWait):
+        def wait(self):
+            self.wait_calls += 1
+            return self.final_rc
+
+    fake = PlainProc(final_rc=3)
+    assert tr._apply_planfile(["tofu", "apply"], Path("."), {}, popen=fake) == 3
+    assert fake.wait_calls == 1 and not fake.killed
+
+
+def test_real_child_survives_a_real_sigint_and_finishes(tmp_path):
+    """The hard case with a real process: the child shrugs off SIGINT (as
+    tofu does while stopping gracefully), the parent's wait is interrupted
+    by a real SIGINT, and the child still completes its work untouched."""
+    import signal
+    import threading
+
+    marker = tmp_path / "state-written"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import signal, sys, time, pathlib\n"
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "time.sleep(1.0)\n"
+        f"pathlib.Path({str(marker)!r}).write_text('graceful')\n"
+        "sys.exit(0)\n"
+    )
+    pid = os.getpid()
+    timer = threading.Timer(0.3, lambda: os.kill(pid, signal.SIGINT))
+    timer.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            tr._apply_planfile([sys.executable, "-I", str(child)], tmp_path,
+                               {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"]})
+    finally:
+        timer.cancel()
+    assert marker.read_text() == "graceful", "the child was killed before it could write state"

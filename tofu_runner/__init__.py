@@ -166,8 +166,31 @@ def parse_gate_overrides(args: list[str]) -> tuple[list[str], dict[str, str]]:
     return rest, {a: reason for a in addrs}
 
 
+def _apply_planfile(args: list[str], cwd: Path, env: dict[str, str],
+                    popen=subprocess.Popen) -> int:
+    """Run the final ``tofu apply <planfile>`` so an operator Ctrl-C cannot
+    orphan infrastructure: on SIGINT the child has the same signal and stops
+    gracefully (in-flight provider calls finish, state is written), but
+    ``subprocess.run`` would SIGKILL it after 0.25 s. Here we never kill —
+    we wait for tofu to finish stopping, then re-raise the interrupt. A
+    second Ctrl-C reaches tofu directly and is tofu's own hard-stop; we
+    still only reap."""
+    proc = popen(args, cwd=cwd, env=env)  # noqa: S603
+    interrupted = False
+    while True:
+        try:
+            rc = proc.wait()
+            break
+        except KeyboardInterrupt:
+            interrupted = True
+    if interrupted:
+        raise KeyboardInterrupt
+    return rc
+
+
 def run_verb(verb: str, extra: list[str], env: dict[str, str], tf_dir: Path,
-             gate=None, run=subprocess.run, ensure_init: bool = True) -> int:
+             gate=None, run=subprocess.run, ensure_init: bool = True,
+             popen=subprocess.Popen) -> int:
     """Execute one verb. ``plan`` streams tofu's human-readable output;
     ``apply``/``destroy`` run the gated planfile pipeline (module docstring).
     ``gate`` is called with the parsed plan JSON and raises to refuse.
@@ -201,4 +224,4 @@ def run_verb(verb: str, extra: list[str], env: dict[str, str], tf_dir: Path,
             raise RunnerError(f"tofu show -json on the plan file exited {shown.returncode}")
         if gate is not None:
             gate(json.loads(shown.stdout or "{}"))
-        return run(["tofu", "apply", "-input=false", planfile], cwd=tf_dir, env=env, check=False).returncode  # noqa: S603, S607
+        return _apply_planfile(["tofu", "apply", "-input=false", planfile], tf_dir, env, popen=popen)  # noqa: S607
